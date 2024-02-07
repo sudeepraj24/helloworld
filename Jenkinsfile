@@ -1,75 +1,193 @@
 pipeline {
+
   agent any
 
-  tools {
-    jdk 'Java'
-    maven 'Maven'
-  }
-  
-  environment {
+environment {
 
-      sonar_url = 'http://10.128.0.5:9000'
+      sonar_url = 'http://10.1.1.18:9000'
       sonar_username = 'admin'
-      sonar_password = 'admin'
-      nexus_url = '10.128.0.4:8081'
-      artifact_version = '1.0.0'
+      sonar_password = 'admin#sonar#123'
+      nexus_url = '35.222.210.226:8081'
+      artifact_version = '0.0.1'
 
  }
- parameters {
-      string(defaultValue: 'main', description: 'Please type any branch name to deploy', name: 'Branch')
- }  
+  options {
+    buildDiscarder(logRotator(artifactDaysToKeepStr: '', artifactNumToKeepStr: '', daysToKeepStr: '2', numToKeepStr: '10'))
+    ansiColor('xterm')
+    disableConcurrentBuilds()
+  }
 
-stages {
-    stage('Git checkout'){
+
+  tools {
+    jdk 'JAVA8'
+    maven 'Maven-3.3'
+
+  }
+
+
+  parameters {
+      string(defaultValue: 'discovery-service', description: 'COC Service name', name: 'Service')
+      string(defaultValue: 'master', description: 'COC branch to build', name: 'Branch')
+      choice(
+        name: 'Cluster',
+        choices: ['gke_cognitive-genie-63754_us-central1-a_rapid-istio'],
+        description: 'Cluster you want to deploy the pod to' )
+
+  }
+
+
+  stages {
+    stage ('Cleanup Workspace') {
       steps {
-        git branch: '${Branch}',
-        url: 'https://github.com/chinni4321/helloworld-project-1.git'
+        cleanWs()
+        }
       }
-    }
-    stage('Maven build'){
-      steps {
-        sh 'mvn clean install'
+    stage ('Checkout Codebase') {
+        steps {
+          echo "====== Current WORKSPACE Directory is ${env.WORKSPACE} ======="
+          echo "============== GIT Source Code Branch: ${Branch} =============="
+          checkout(
+            [
+              $class: 'GitSCM',
+              branches: [[name: '${Branch}']],
+              doGenerateSubmoduleConfigurations: false,
+              extensions: [
+                [$class: 'CleanBeforeCheckout'],
+                [$class: 'CloneOption', depth: 0, noTags: false, reference: '', shallow: false, timeout: 120],
+                [$class: 'CheckoutOption', timeout: 120],
+                [$class: 'CleanBeforeCheckout'],
+                [$class: 'CleanCheckout'],
+                [$class: 'PruneStaleBranch']
+                ],
+                submoduleCfg: [],
+                userRemoteConfigs: [
+                  [
+                    credentialsId: '5a2a0d63-2d2c-4bb0-94a0-db4dc740f911',
+                    url: 'https://pscode.lioncloud.net/commerceoncloud/${Service}.git'
+                    ]
+                  ]
+                ],
+              )
+          }
+        }
+     stage ('Build and Compile Codebase') {
+        steps {
+          sh '''
+          mvn clean install -U -Dmaven.test.skip=true
+          mvn -f ${WORKSPACE}/ clean install checkstyle:checkstyle findbugs:findbugs pmd:pmd pmd:cpd cobertura:cobertura -Dcobertura.report.format=xml
+          '''
+        }
       }
-    }
-  stage ('Sonarqube Analysis'){
+    stage ('adding check for API contract testing'){
+         steps{
+          script{
+              if (fileExists ("${WORKSPACE}/src/test/resources/contracts/**/*.groovy" )) {
+              currentBuild.result = 'CONTINUE'
+              }else{
+              currentBuild.result = 'ABORTED'
+              print "Please add APIContract testing files"
+             }
+           }
+         }
+       }
+     
+     stage ('Sonarqube Analysis'){
            steps {
-           withSonarQubeEnv('Sonarqube') {
+           withSonarQubeEnv('SonarQube') {
            sh '''
+           mvn clean package org.jacoco:jacoco-maven-plugin:prepare-agent install -Dmaven.test.failure.ignore=false
            mvn -e -B sonar:sonar -Dsonar.java.source=1.8 -Dsonar.host.url="${sonar_url}" -Dsonar.login="${sonar_username}" -Dsonar.password="${sonar_password}" -Dsonar.sourceEncoding=UTF-8
            '''
            }
          }
-      } 
-       stage ('Publish Artifact') {
+      }
+     stage("Quality Gate") {
+
+         steps {
+              sleep(30)
+              script {
+               def qualitygate = waitForQualityGate()
+               if (qualitygate.status != "OK") {
+               error "Pipeline aborted due to quality gate failure: ${qualitygate.status}"
+               }
+              }
+            }
+          }
+    /* stage ('Publish Artifact') {
         steps {
-          nexusArtifactUploader artifacts: [[artifactId: 'hello-world-war', classifier: '', file: "target/hello-world-war-1.0.0.war", type: 'war']], credentialsId: 'nexus-cred', groupId: 'com.efsavage', nexusUrl: "${nexus_url}", nexusVersion: 'nexus3', protocol: 'http', repository: 'release', version: "${artifact_version}"
+          nexusArtifactUploader artifacts: [[artifactId: '${Service}', classifier: '', file: "target/${Service}-${env.artifact_version}.jar", type: 'jar']], credentialsId: 'ca1d8e48-50b5-46c5-ba0c-7762f4403926', groupId: 'com.sapient.mc', nexusUrl: "${nexus_url}", nexusVersion: 'nexus3', protocol: 'http', repository: 'releases', version: "${artifact_version}"
         }
       }
+      stage ('Archive Artifact') {
+        steps {
+          archiveArtifacts '**/*.jar'
+        }
+      }/*
       stage ('Build Docker Image'){
         steps {
           sh '''
           cd ${WORKSPACE}
-          docker build -t gcr.io/fleet-impact-392712/helloworld --file=Dockerfile ${WORKSPACE}
+          docker build -t gcr.io/cognitive-genie-63754/COC_${Service} --file=src/main/docker/Dockerfile ${WORKSPACE}
           '''
         }
       }
       stage ('Publish Docker Image'){
         steps {
           sh '''
-          docker push gcr.io/fleet-impact-392712/helloworld
+          docker push gcr.io/cognitive-genie-63754/COC_${Service}:latest
+          '''
+        }
+      }
+      stage ('CleanUp Docker Image'){
+        steps {
+          sh '''
+          if [ `docker images --format '{{.Repository}}' | grep "mesh_${Service}" | wc -l` -gt 0 ]; then
+echo "INFO => removing local docker images for mesh_${Service}, please wait..."
+docker rmi -f `docker images --format '{{.Repository}} {{.ID}}' | grep "mesh_${Service}" | cut -f2 -d ' ' | uniq`
+fi
           '''
         }
       }
       stage ('Deploy to kubernetes'){
         steps{
           script {
-            sh "kubectl config use-context gke_fleet-impact-392712_us-central1-c_k8s-cluster"
-            sh "cd ${WORKSPACE}"
-            sh "kubectl delete -f '${WORKSPACE}'/kube/deployment.yaml"
-            sh "kubectl apply -f '${WORKSPACE}'/kube/deployment.yaml"
-            sh "kubectl apply -f '${WORKSPACE}'/kube/service.yaml"
+
+          if ( env.cluster == 'gke_cognitive-genie-63754_us-central1-a_rapid-istio'){
+          try{
+            sh "kubectl config use-context ${Cluster}"
+       sh "export PATH=/home/jenkins/istio-1.0.5/bin:$PATH"
+     sh "cd ${WORKSPACE}"
+     sh "kubectl delete -f '${WORKSPACE}'/src/main/kube/deployment.yml"
+     sh "kubectl apply -f '${WORKSPACE}'/src/main/kube/service.yml"
+     sh "kubectl apply -f '${WORKSPACE}'/src/main/kube/deployment.yml"
+     sh "kubectl apply -f '${WORKSPACE}'/src/main/networking/config-gateway.yml"
+
+            }catch (Exception e) {
+
+         sh "kubectl apply -f '${WORKSPACE}'/src/main/kube/service.yml"
+         sh "kubectl apply -f '${WORKSPACE}'/src/main/kube/deployment.yml"
+         sh "kubectl apply -f '${WORKSPACE}'/src/main/networking/config-gateway.yml"
+     }
+            }
+            else {
+            try{
+               sh "kubectl config use-context ${Cluster}"
+               sh "cd ${WORKSPACE}"
+               sh "kubectl delete -f '${WORKSPACE}'/src/main/kube/deployment.yml"
+        sh "kubectl apply -f  '${WORKSPACE}'/src/main/kube/service.yml"
+        sh "kubectl apply -f '${WORKSPACE}'/src/main/kube/deployment.yml"
+               }catch (Exception e) {
+
+         sh "kubectl apply -f '${WORKSPACE}'/src/main/kube/service.yml"
+         sh "kubectl apply -f '${WORKSPACE}'/src/main/kube/deployment.yml"
+         sh "kubectl apply -f '${WORKSPACE}'/src/main/networking/config-gateway.yml"
+     }
+
           }
-         }
         }
-   }
+       }
+      }
+
+
+  }
 }

@@ -18,4 +18,4 @@ Ref: https://github.com/arun-gupta/docker-kubernetes-hello-world
 
 * http://localhost:8082/hello-world-war-1.0.0
 -------------------------------------------
-this is out of seps
+
